@@ -5,10 +5,10 @@ import Chatbot from "../components/Chatbot"
 
 const STEPS = [
     { id: 1, label: "Uploading file...", icon: "⬆️" },
-    { id: 2, label: "Extracting text from PDF...", icon: "📄" },
-    { id: 3, label: "Analysing content with AI...", icon: "🤖" },
-    { id: 4, label: "Generating structured summary...", icon: "✍️" },
-    { id: 5, label: "Finalising your document...", icon: "📦" },
+    { id: 2, label: "Extracting & chunking text...", icon: "📄" },
+    { id: 3, label: "Generating embeddings with AI...", icon: "🧠" },
+    { id: 4, label: "Retrieving relevant sections (RAG)...", icon: "🔍" },
+    { id: 5, label: "Building structured summary...", icon: "✍️" },
 ]
 
 export default function Upload() {
@@ -165,7 +165,7 @@ export default function Upload() {
                             Upload Your PDF
                         </h1>
                         <p style={{ color: "#64748b", fontSize: "15px", margin: 0 }}>
-                            Get a structured 2-page AI summary of any financial document
+                            Get a structured AI-powered summary of any financial document
                         </p>
                     </div>
 
@@ -355,7 +355,7 @@ export default function Upload() {
                                     </div>
                                     <div>
                                         <p style={{ fontWeight: 700, color: "#15803d", fontSize: "14px", margin: 0 }}>Summary Ready!</p>
-                                        <p style={{ color: "#16a34a", fontSize: "12px", margin: 0 }}>Your 2-page structured summary has been generated.</p>
+                                        <p style={{ color: "#16a34a", fontSize: "12px", margin: 0 }}>Your structured RAG-powered summary has been generated.</p>
                                     </div>
                                 </div>
 

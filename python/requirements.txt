@@ -1,0 +1,16 @@
+# AlphaSense Python Dependencies
+# Install with: pip install -r requirements.txt
+
+# PDF extraction
+pdfplumber
+
+# RAG pipeline
+sentence-transformers
+faiss-cpu
+
+# PDF generation
+reportlab
+
+# (Optional: already installed as dep of sentence-transformers)
+# numpy
+# torch

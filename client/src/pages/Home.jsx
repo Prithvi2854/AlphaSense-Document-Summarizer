@@ -92,7 +92,7 @@ export default function Home() {
                     AI-Powered Financial PDF Summarizer
                 </h1>
                 <p style={{ color: "#bfdbfe", fontSize: "16px", margin: "0 0 28px" }}>
-                    Upload any financial document and get a clean, structured 2-page summary in seconds.
+                    Upload any financial document and get a clean, structured AI-powered summary in seconds.
                 </p>
                 <button className="btn-hero" onClick={() => navigate("/upload")}>
                     <svg width="18" height="18" fill="none" stroke="currentColor" viewBox="0 0 24 24">

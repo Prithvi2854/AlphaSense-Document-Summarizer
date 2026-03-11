@@ -3,9 +3,11 @@ import axios from "axios"
 
 const SUGGESTIONS = [
     "What is the executive summary?",
-    "What are the key highlights?",
-    "What financial metrics are mentioned?",
-    "What is the conclusion?",
+    "What are the key financial highlights?",
+    "What is the revenue and profit overview?",
+    "What are the key risks and challenges?",
+    "What are the strategic initiatives?",
+    "What is the future outlook?",
 ]
 
 export default function Chatbot({ summaryPdf }) {
@@ -13,7 +15,7 @@ export default function Chatbot({ summaryPdf }) {
     const [messages, setMessages] = useState([
         {
             role: "assistant",
-            text: "👋 Hi! I'm your AlphaSense AI assistant. Ask me anything about your summarised document!",
+            text: "👋 Hi! I'm your AlphaSense RAG AI assistant. I've analysed your document — ask me anything about it!",
         },
     ])
     const [input, setInput] = useState("")
