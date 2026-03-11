@@ -19,42 +19,48 @@ from reportlab.lib.units import cm
 from reportlab.lib import colors
 
 # ── Constants ────────────────────────────────────────────────────────────────
-CHUNK_SIZE    = 800   # target tokens per chunk (approx words)
-CHUNK_OVERLAP = 120  # overlap tokens
-TOP_K         = 8     # chunks retrieved per section
+CHUNK_SIZE    = 800
+CHUNK_OVERLAP = 120
+TOP_K         = 10   # fetch more chunks so financial sections have more to pick from
 MODEL_NAME    = "all-MiniLM-L6-v2"
 
-# Financial section queries — used to retrieve the most relevant chunks
+# Financial section queries & settings
 SECTIONS = [
     {
         "title": "1. Executive Summary",
-        "query": "executive summary overview company business operations annual report",
+        "query": "company overview business description operations products services revenue",
         "bullets": 5,
+        "requires_numbers": False,
     },
     {
         "title": "2. Financial Highlights",
-        "query": "financial highlights key figures earnings revenue profit loss quarterly annual",
+        "query": "total revenue net income earnings per share EPS diluted billion million grew increased decreased",
         "bullets": 6,
+        "requires_numbers": True,   # every bullet MUST contain a number
     },
     {
         "title": "3. Revenue & Profit Overview",
-        "query": "revenue net profit gross margin EBITDA income operating profit growth percentage",
+        "query": "revenue profit loss gross margin operating income EBITDA net margin percentage growth year over year",
         "bullets": 6,
+        "requires_numbers": True,
     },
     {
         "title": "4. Key Risks & Challenges",
-        "query": "risks challenges uncertainties market risk regulatory compliance debt liquidity",
+        "query": "risk factor challenge uncertainty debt interest expense credit loss regulatory compliance litigation",
         "bullets": 5,
+        "requires_numbers": False,
     },
     {
         "title": "5. Strategic Initiatives",
-        "query": "strategy initiatives investments expansion acquisitions partnerships innovation",
+        "query": "strategy acquisition investment partnership expansion product innovation capital expenditure",
         "bullets": 5,
+        "requires_numbers": False,
     },
     {
         "title": "6. Future Outlook",
-        "query": "outlook guidance forecast future targets growth projections next year",
+        "query": "guidance outlook forecast projected expected target next year growth plan dividend share repurchase",
         "bullets": 5,
+        "requires_numbers": False,
     },
 ]
 
@@ -105,12 +111,33 @@ def extract_text(pdf_path: str) -> str:
                         continue
                     for row in rows:
                         cells = [str(c).strip() for c in row if c and str(c).strip()]
-                        if cells:
-                            all_text_parts.append("  |  ".join(cells))
+                        if not cells:
+                            continue
+                        formatted = format_table_row(cells)
+                        if formatted:
+                            all_text_parts.append(formatted)
                 except Exception:
                     pass
 
     return "\n".join(all_text_parts)
+
+
+def format_table_row(cells: list) -> str:
+    """
+    Convert a list of table cells into a readable financial sentence.
+    e.g. ['Revenue', '$60.6', '$58.5']  →  'Revenue: $60.6 | $58.5'
+         ['Net Income', '3,134', '2,765'] → 'Net Income: 3,134 | 2,765'
+    Skips rows that are all headers with no numbers.
+    """
+    if not cells:
+        return ""
+    # Must contain at least one numeric-looking cell (besides label) to be useful
+    numeric_cells = [c for c in cells[1:] if re.search(r'\d', c)]
+    if not numeric_cells:
+        return ""   # pure header row — skip
+    label = cells[0].strip().rstrip(':')
+    values = "  |  ".join(c.strip() for c in cells[1:] if c.strip())
+    return f"{label}: {values}"
 
 
 def fix_spacing(text: str) -> str:
@@ -211,6 +238,41 @@ def retrieve(query: str, index, chunks: list, model: SentenceTransformer, top_k:
     return [chunks[i] for i in indices[0] if i >= 0]
 
 
+# ── Financial figure detection helpers ───────────────────────────────────────
+
+# Patterns that indicate real financial data (not theory)
+_FIN_STRONG = re.compile(
+    r'\$\s*[\d,\.]+\s*(billion|million|trillion|B|M|bn|mn)?'
+    r'|[\d,\.]+\s*(billion|million|trillion)'
+    r'|[\d,]+\s*%'
+    r'|\bEPS\b|\bEBITDA\b|\bROE\b|\bROA\b',
+    re.I
+)
+_FIN_WEAK = re.compile(r'\b\d[\d,\.]*\b')   # any number at all
+
+
+def score_sentence(sent: str, word_freq: dict) -> float:
+    """
+    Score a sentence for financial relevance:
+    - TF keyword richness (base)
+    - 5x multiplier for explicit dollar/percent/billion/million values
+    - 2x multiplier for any number
+    - penalty for very short or vague sentences
+    """
+    words = re.findall(r'\b[a-zA-Z]{3,}\b', sent.lower())
+    base = sum(word_freq.get(w, 0) for w in words if w not in _STOPWORDS)
+    if _FIN_STRONG.search(sent):
+        return base * 5.0
+    if _FIN_WEAK.search(sent):
+        return base * 2.0
+    return base
+
+
+def has_numbers(sent: str) -> bool:
+    """Return True if sentence contains at least one numeric value."""
+    return bool(_FIN_WEAK.search(sent))
+
+
 # ── 6. Bullet extraction ──────────────────────────────────────────────────────
 
 _STOPWORDS = set("""a an the and or but in on at to for of with is are was were
@@ -221,11 +283,16 @@ _STOPWORDS = set("""a an the and or but in on at to for of with is are was were
     your my we they he she i you""".split())
 
 
-def extract_bullets(retrieved_chunks: list, n_bullets: int, used_globally: list) -> list:
+def extract_bullets(
+    retrieved_chunks: list,
+    n_bullets: int,
+    used_globally: list,
+    requires_numbers: bool = False,
+) -> list:
     """
-    From retrieved chunks -> split into sentences -> filter garbled ones ->
-    score by keyword richness -> deduplicate within-section AND cross-section
-    (via used_globally) -> return top-N clean bullets.
+    From retrieved chunks → sentences → filter garbled → score (financial-aware)
+    → deduplicate globally → return top-N bullets.
+    If requires_numbers=True, only sentences with numeric values are accepted.
     """
     from collections import Counter
 
@@ -238,8 +305,17 @@ def extract_bullets(retrieved_chunks: list, n_bullets: int, used_globally: list)
         sub = [p.strip() for p in s.split('\n') if len(p.strip()) > 50]
         sents.extend(sub if sub else ([s.strip()] if len(s.strip()) > 50 else []))
 
-    # Filter out garbled / too-short sentences
-    clean_sents = [s for s in sents if not is_garbled(s) and len(s) > 55]
+    # Filter: garbled, too short, and optionally requires a number
+    clean_sents = [
+        s for s in sents
+        if not is_garbled(s)
+        and len(s) > 55
+        and (not requires_numbers or has_numbers(s))
+    ]
+
+    # Fallback: if requires_numbers produced nothing, relax that constraint
+    if not clean_sents:
+        clean_sents = [s for s in sents if not is_garbled(s) and len(s) > 55]
 
     if not clean_sents:
         return ["No relevant information could be retrieved for this section."]
@@ -253,13 +329,8 @@ def extract_bullets(retrieved_chunks: list, n_bullets: int, used_globally: list)
 
     scored = []
     for sent in clean_sents:
-        words = re.findall(r'\b[a-zA-Z]{3,}\b', sent.lower())
-        score = sum(word_freq.get(w, 0) for w in words if w not in _STOPWORDS)
-        if re.search(r'\$[\d,]+|[\d,.]+\s*%|[\d,.]+\s*(billion|million)', sent, re.I):
-            score *= 1.5   # strong boost for financial figures
-        elif re.search(r'\d', sent):
-            score *= 1.2
-        scored.append((score, sent))
+        sc = score_sentence(sent, word_freq)
+        scored.append((sc, sent))
 
     scored.sort(key=lambda x: -x[0])
 
@@ -419,10 +490,15 @@ def main():
     # Step 4 — Retrieve & generate per section
     print("Retrieving relevant sections...", flush=True)
     sections_content = []
-    used_globally: list = []   # ← cross-section dedup pool
+    used_globally: list = []   # cross-section dedup pool
     for sec in SECTIONS:
         retrieved = retrieve(sec["query"], index, chunks, model, top_k=TOP_K)
-        bullets = extract_bullets(retrieved, sec["bullets"], used_globally)
+        bullets = extract_bullets(
+            retrieved,
+            sec["bullets"],
+            used_globally,
+            requires_numbers=sec.get("requires_numbers", False),
+        )
         sections_content.append({"title": sec["title"], "bullets": bullets})
         print(f"  {sec['title']} — {len(bullets)} bullets", flush=True)
 
