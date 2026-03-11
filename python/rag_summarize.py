@@ -5,6 +5,7 @@ Pipeline: extract → chunk → embed (SentenceTransformers) → FAISS index
 """
 
 import sys
+import os
 import re
 import numpy as np
 import pdfplumber
@@ -65,7 +66,42 @@ SECTIONS = [
 ]
 
 
-# ── 1. PDF Text Extraction ────────────────────────────────────────────────────
+# ── 1. PDF Text Extraction & Company Name ────────────────────────────────────
+
+# Corporate name suffixes to look for
+_CORP_SUFFIX = re.compile(
+    r'\b(Inc|Corp|Corporation|Ltd|Limited|LLC|L\.L\.C|PLC|Group|Holdings|Bancorp|Bancshares|Financial|Technologies|Solutions|Enterprises|Industries|Energy|Healthcare|Pharmaceuticals)\.?\b',
+    re.I
+)
+
+def extract_company_name(pdf_path: str) -> str:
+    """
+    Scan the first 3 pages of the PDF for a company name.
+    Looks for lines that contain a corporate suffix keyword.
+    Falls back to the PDF filename (without extension).
+    """
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            for page in pdf.pages[:3]:
+                words = page.extract_words(x_tolerance=4, y_tolerance=4)
+                # Group words into lines by their approximate y-position
+                lines: dict = {}
+                for w in words:
+                    y = round(w["top"] / 5) * 5   # bucket by ~5pt
+                    lines.setdefault(y, []).append(w["text"])
+                for y in sorted(lines):
+                    line = " ".join(lines[y]).strip()
+                    if _CORP_SUFFIX.search(line) and len(line) < 80:
+                        # Strip leading page numbers / symbols
+                        name = re.sub(r'^[\s\d\.\-]+', '', line).strip()
+                        if name:
+                            return name
+    except Exception:
+        pass
+    # Fallback: use filename
+    base = os.path.basename(pdf_path)
+    return os.path.splitext(base)[0].replace('_', ' ').title()
+
 
 def extract_text(pdf_path: str) -> str:
     """
@@ -183,9 +219,9 @@ def is_garbled(sentence: str) -> bool:
     Return True if the sentence looks like garbage, table column data, or
     raw number sequences that should not appear as a bullet.
     """
-    if _max_word_len(sentence) > 35:
+    if _max_word_len(sentence) > 22:   # catches run-together words like 'Accumulatedimpairmentlosses'
         return True
-    if _long_word_ratio(sentence, threshold=20) > 0.25:
+    if _long_word_ratio(sentence, threshold=18) > 0.20:
         return True
     alpha = sum(1 for c in sentence if c.isalpha())
     if len(sentence) > 0 and alpha / len(sentence) < 0.38:
@@ -216,14 +252,29 @@ _STRIP_REFS = [
     re.compile(r'\|'),
 ]
 
-# Sentences that are clearly table intros or index lines — reject entirely
+# Sentences that are clearly noise — reject entirely
 _REJECT_PATTERNS = [
+    # Table intros
     re.compile(r'following table', re.I),
     re.compile(r'as follows:', re.I),
     re.compile(r'see note \d', re.I),
     re.compile(r'^table \d', re.I),
     re.compile(r'refer to note', re.I),
     re.compile(r'\(dollars in', re.I),
+    # SEC filing references (exhibit/item/appendix)
+    re.compile(r'\bITEM\s+\d', re.I),
+    re.compile(r'\bEXHIBIT\s+\d', re.I),
+    re.compile(r'^[A-Z]-\d'),             # e.g. "A-4 Changes in..."
+    re.compile(r'\bPage\s+\d+\b', re.I),  # page number references
+    # Signature / officer blocks
+    re.compile(r'/s/'),                    # legal signature marker
+    re.compile(r'\bPrincipal Accounting Officer\b', re.I),
+    re.compile(r'\bChief (Executive|Financial|Operating|Accounting) Officer\b', re.I),
+    re.compile(r'\bExecutive Vice President\b', re.I),
+    re.compile(r'\bSenior Vice President\b', re.I),
+    re.compile(r'\bBoard of Directors\b', re.I),
+    # Pure name lists (no verbs — person name + title only)
+    re.compile(r'^[A-Z][a-z]+ [A-Z][a-z]+ [A-Z][a-z]+ (Vice|Executive|Director|President|Officer)', re.I),
 ]
 
 
@@ -438,7 +489,7 @@ def _jaccard(a: str, b: str) -> float:
 
 # ── 7. PDF Generation ─────────────────────────────────────────────────────────
 
-def build_pdf(sections_content: list, output_path: str):
+def build_pdf(sections_content: list, output_path: str, company_name: str = ""):
     """Generate the structured summary PDF with reportlab."""
     styles = getSampleStyleSheet()
 
@@ -495,12 +546,21 @@ def build_pdf(sections_content: list, output_path: str):
 
     story = []
 
-    # Header
-    story.append(Paragraph("AlphaSense \u2013 Financial Document Summary", title_style))
-    story.append(Paragraph(
-        "AI-generated RAG-powered structured summary \u00b7 For reference only",
-        subtitle_style
-    ))
+    # Header — company name + AlphaSense branding
+    if company_name:
+        safe_name = (company_name
+                     .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+        story.append(Paragraph(safe_name, title_style))
+        story.append(Paragraph(
+            "Financial Document Summary · Powered by AlphaSense RAG",
+            subtitle_style
+        ))
+    else:
+        story.append(Paragraph("AlphaSense – Financial Document Summary", title_style))
+        story.append(Paragraph(
+            "AI-generated RAG-powered structured summary · For reference only",
+            subtitle_style
+        ))
     story.append(HRFlowable(
         width="100%", thickness=2,
         color=colors.HexColor("#1e40af"), spaceAfter=10
@@ -543,9 +603,11 @@ def main():
     pdf_path = sys.argv[1]
     output_path = pdf_path.replace(".pdf", "_summary.pdf")
 
-    # Step 1 — Extract text
+    # Step 1 — Extract text & company name
     print("Extracting text from PDF...", flush=True)
     raw_text = extract_text(pdf_path)
+    company_name = extract_company_name(pdf_path)
+    print(f"  Company: {company_name}", flush=True)
     if not raw_text.strip():
         print("Error: No text could be extracted from this PDF.", file=sys.stderr)
         sys.exit(1)
@@ -582,7 +644,7 @@ def main():
 
     # Step 5 — Build PDF
     print("Generating summary PDF...", flush=True)
-    build_pdf(sections_content, output_path)
+    build_pdf(sections_content, output_path, company_name=company_name)
     print(f"Summary saved to {output_path}", flush=True)
     sys.exit(0)
 
