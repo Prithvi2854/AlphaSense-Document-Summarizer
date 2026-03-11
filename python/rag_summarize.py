@@ -221,10 +221,11 @@ _STOPWORDS = set("""a an the and or but in on at to for of with is are was were
     your my we they he she i you""".split())
 
 
-def extract_bullets(retrieved_chunks: list, n_bullets: int) -> list:
+def extract_bullets(retrieved_chunks: list, n_bullets: int, used_globally: list) -> list:
     """
     From retrieved chunks -> split into sentences -> filter garbled ones ->
-    score by keyword richness -> deduplicate -> return top-N clean bullets.
+    score by keyword richness -> deduplicate within-section AND cross-section
+    (via used_globally) -> return top-N clean bullets.
     """
     from collections import Counter
 
@@ -262,15 +263,21 @@ def extract_bullets(retrieved_chunks: list, n_bullets: int) -> list:
 
     scored.sort(key=lambda x: -x[0])
 
-    # Deduplicate (Jaccard > 0.55 = too similar)
-    seen, result = [], []
+    # Deduplicate: skip if too similar to anything seen in THIS section
+    # OR any PREVIOUS section (used_globally) — threshold 0.45 (tighter)
+    seen_local, result = [], []
     for _, sent in scored:
-        if not any(_jaccard(sent, s) > 0.55 for s in seen):
-            seen.append(sent)
-            bullet = sent if len(sent) <= 240 else sent[:237] + "..."
-            result.append(bullet)
+        all_seen = used_globally + seen_local
+        if any(_jaccard(sent, s) > 0.45 for s in all_seen):
+            continue  # already used somewhere — skip
+        seen_local.append(sent)
+        bullet = sent if len(sent) <= 240 else sent[:237] + "..."
+        result.append(bullet)
         if len(result) == n_bullets:
             break
+
+    # Register winners into the global cross-section pool
+    used_globally.extend(seen_local)
 
     return result if result else ["No relevant information could be retrieved for this section."]
 
@@ -412,9 +419,10 @@ def main():
     # Step 4 — Retrieve & generate per section
     print("Retrieving relevant sections...", flush=True)
     sections_content = []
+    used_globally: list = []   # ← cross-section dedup pool
     for sec in SECTIONS:
         retrieved = retrieve(sec["query"], index, chunks, model, top_k=TOP_K)
-        bullets = extract_bullets(retrieved, sec["bullets"])
+        bullets = extract_bullets(retrieved, sec["bullets"], used_globally)
         sections_content.append({"title": sec["title"], "bullets": bullets})
         print(f"  {sec['title']} — {len(bullets)} bullets", flush=True)
 
