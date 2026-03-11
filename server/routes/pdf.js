@@ -9,12 +9,8 @@ import File from "../models/File.js"
 // Python executable inside the project .venv
 const PYTHON_BIN = path.join(process.cwd(), "..", ".venv", "Scripts", "python.exe")
 
-
-
-const upload = multer({ limits: { fileSize: 500 * 1024 * 1024 } })
-const router = express.Router()
-
-const serverDir = process.cwd()
+// ── Paths ─────────────────────────────────────────────────────────────────────
+const serverDir  = process.cwd()
 const uploadsDir = path.join(serverDir, "uploads")
 
 // Ensure uploads directory exists
@@ -22,14 +18,27 @@ if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true })
 }
 
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, uploadsDir),
+  filename:    (req, file, cb) => cb(null, `${Date.now()}.pdf`),
+})
+const upload = multer({
+  storage,
+  limits: { fileSize: 500 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype === "application/pdf") cb(null, true)
+    else cb(new Error("Only PDF files are allowed"), false)
+  },
+})
+const router = express.Router()
+
+
 // POST /upload - upload and summarise a PDF
 router.post("/upload", upload.single("pdf"), async (req, res) => {
   try {
-    const timestamp = Date.now()
-    const fileName = `${timestamp}.pdf`
-    const filePath = path.join(uploadsDir, fileName)
-
-    fs.writeFileSync(filePath, req.file.buffer)
+    const filePath = req.file.path                         // disk path set by multer
+    const fileName = path.basename(filePath)
+    const timestamp = fileName.replace(".pdf", "")
 
     const summaryFileName = `${timestamp}_summary.pdf`
     const summaryPath = path.join(uploadsDir, summaryFileName)
