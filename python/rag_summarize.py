@@ -6,7 +6,6 @@ Pipeline: extract → chunk → embed (SentenceTransformers) → FAISS index
 
 import sys
 import re
-import textwrap
 import numpy as np
 import pdfplumber
 import faiss
@@ -20,10 +19,10 @@ from reportlab.lib.units import cm
 from reportlab.lib import colors
 
 # ── Constants ────────────────────────────────────────────────────────────────
-CHUNK_SIZE   = 800   # target tokens per chunk (approx words)
+CHUNK_SIZE    = 800   # target tokens per chunk (approx words)
 CHUNK_OVERLAP = 120  # overlap tokens
-TOP_K        = 6     # chunks retrieved per section
-MODEL_NAME   = "all-MiniLM-L6-v2"
+TOP_K         = 8     # chunks retrieved per section
+MODEL_NAME    = "all-MiniLM-L6-v2"
 
 # Financial section queries — used to retrieve the most relevant chunks
 SECTIONS = [
@@ -60,22 +59,78 @@ SECTIONS = [
 ]
 
 
-# ── 1. PDF Text Extraction ───────────────────────────────────────────────────
+# ── 1. PDF Text Extraction ────────────────────────────────────────────────────
 
 def extract_text(pdf_path: str) -> str:
-    """Extract full text from PDF using pdfplumber (handles multi-column layouts)."""
-    pages_text = []
+    """
+    Extract text from PDF using pdfplumber with word-level spacing.
+    Tables are extracted separately to get structured content without garbling.
+    """
+    all_text_parts = []
+
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
-            text = page.extract_text(x_tolerance=3, y_tolerance=3)
-            if text:
-                pages_text.append(text)
-    return "\n".join(pages_text)
+
+            # --- Get table bounding boxes so we can exclude them from body text ---
+            tables = page.find_tables()
+            table_bboxes = [tbl.bbox for tbl in tables]
+
+            # --- Extract body text (words) outside table regions ---
+            words = page.extract_words(
+                x_tolerance=4,
+                y_tolerance=4,
+                keep_blank_chars=False,
+                use_text_flow=True,
+            )
+
+            body_words = []
+            for w in words:
+                cx = (w["x0"] + w["x1"]) / 2
+                cy = (w["top"] + w["bottom"]) / 2
+                in_table = any(
+                    bx0 <= cx <= bx1 and by0 <= cy <= by1
+                    for bx0, by0, bx1, by1 in table_bboxes
+                )
+                if not in_table:
+                    body_words.append(w["text"])
+
+            if body_words:
+                all_text_parts.append(" ".join(body_words))
+
+            # --- Extract tables as structured rows ---
+            for tbl in tables:
+                try:
+                    rows = tbl.extract()
+                    if not rows:
+                        continue
+                    for row in rows:
+                        cells = [str(c).strip() for c in row if c and str(c).strip()]
+                        if cells:
+                            all_text_parts.append("  |  ".join(cells))
+                except Exception:
+                    pass
+
+    return "\n".join(all_text_parts)
+
+
+def fix_spacing(text: str) -> str:
+    """
+    Insert spaces into concatenated CamelCase / ALLCAPS runs that pdfplumber
+    sometimes produces from certain PDF encodings.
+    e.g. "CardMemberReceivables" -> "Card Member Receivables"
+    """
+    # Insert space before a capital letter that follows a lowercase letter
+    text = re.sub(r'([a-z])([A-Z])', r'\1 \2', text)
+    # Insert space before digits following letters and vice versa
+    text = re.sub(r'([a-zA-Z])(\d)', r'\1 \2', text)
+    text = re.sub(r'(\d)([a-zA-Z])', r'\1 \2', text)
+    return text
 
 
 def clean_text(text: str) -> str:
-    """Remove noise: excessive whitespace, non-ASCII junk, repeated dashes."""
+    """Remove noise: non-ASCII, excessive whitespace, repeated dashes."""
     text = re.sub(r'[^\x20-\x7E\n]', ' ', text)
+    text = fix_spacing(text)
     text = re.sub(r'[ \t]+', ' ', text)
     text = re.sub(r'\n{3,}', '\n\n', text)
     text = re.sub(r'-{3,}', '', text)
@@ -83,7 +138,38 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
-# ── 2. Chunking ──────────────────────────────────────────────────────────────
+# ── 2. Garbled text detection ─────────────────────────────────────────────────
+
+def _max_word_len(sentence: str) -> int:
+    words = sentence.split()
+    return max((len(w) for w in words), default=0)
+
+def _long_word_ratio(sentence: str, threshold: int = 20) -> float:
+    words = sentence.split()
+    if not words:
+        return 0.0
+    long = sum(1 for w in words if len(w) > threshold)
+    return long / len(words)
+
+def is_garbled(sentence: str) -> bool:
+    """
+    Return True if the sentence looks like concatenated table/encoding garbage.
+    Heuristics:
+      - Any single word > 35 chars (almost certainly a run-together string)
+      - >25% of words are longer than 20 chars
+      - Ratio of alpha chars is very low (symbol/number soup)
+    """
+    if _max_word_len(sentence) > 35:
+        return True
+    if _long_word_ratio(sentence, threshold=20) > 0.25:
+        return True
+    alpha = sum(1 for c in sentence if c.isalpha())
+    if len(sentence) > 0 and alpha / len(sentence) < 0.40:
+        return True
+    return False
+
+
+# ── 3. Chunking ───────────────────────────────────────────────────────────────
 
 def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP):
     """Split text into overlapping word-based chunks."""
@@ -101,7 +187,7 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVE
     return chunks
 
 
-# ── 3. Embedding & FAISS Index ───────────────────────────────────────────────
+# ── 4. Embedding & FAISS Index ────────────────────────────────────────────────
 
 def build_index(chunks: list, model: SentenceTransformer):
     """Embed all chunks and build a FAISS flat L2 index."""
@@ -111,10 +197,10 @@ def build_index(chunks: list, model: SentenceTransformer):
     dim = embeddings.shape[1]
     index = faiss.IndexFlatIP(dim)                        # inner product = cosine after normalisation
     index.add(embeddings)
-    return index, embeddings
+    return index
 
 
-# ── 4. Retrieval ─────────────────────────────────────────────────────────────
+# ── 5. Retrieval ──────────────────────────────────────────────────────────────
 
 def retrieve(query: str, index, chunks: list, model: SentenceTransformer, top_k: int = TOP_K):
     """Retrieve top-K most relevant chunks for a query."""
@@ -125,7 +211,7 @@ def retrieve(query: str, index, chunks: list, model: SentenceTransformer, top_k:
     return [chunks[i] for i in indices[0] if i >= 0]
 
 
-# ── 5. Bullet extraction from retrieved chunks ───────────────────────────────
+# ── 6. Bullet extraction ──────────────────────────────────────────────────────
 
 _STOPWORDS = set("""a an the and or but in on at to for of with is are was were
     be been being have has had do does did will would could should may might
@@ -137,62 +223,64 @@ _STOPWORDS = set("""a an the and or but in on at to for of with is are was were
 
 def extract_bullets(retrieved_chunks: list, n_bullets: int) -> list:
     """
-    Split retrieved chunks into sentences, score them, and return the top-N
-    as bullet points to go into the summary.
+    From retrieved chunks -> split into sentences -> filter garbled ones ->
+    score by keyword richness -> deduplicate -> return top-N clean bullets.
     """
-    # Flatten all retrieved text into sentences
-    all_text = " ".join(retrieved_chunks)
-    # Sentence split
-    raw_sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z])', all_text)
-    sentences = [s.strip() for s in raw_sentences if len(s.strip()) > 50]
+    from collections import Counter
 
-    if not sentences:
+    all_text = " ".join(retrieved_chunks)
+    raw_sents = re.split(r'(?<=[.!?])\s+(?=[A-Z])', all_text)
+
+    # Also split on newlines followed by meaningful content
+    sents = []
+    for s in raw_sents:
+        sub = [p.strip() for p in s.split('\n') if len(p.strip()) > 50]
+        sents.extend(sub if sub else ([s.strip()] if len(s.strip()) > 50 else []))
+
+    # Filter out garbled / too-short sentences
+    clean_sents = [s for s in sents if not is_garbled(s) and len(s) > 55]
+
+    if not clean_sents:
         return ["No relevant information could be retrieved for this section."]
 
-    # Score by keyword richness + number presence (financial relevance)
-    from collections import Counter
+    # TF scoring (financial relevance boost for numbers)
     word_freq = Counter()
-    for sent in sentences:
+    for sent in clean_sents:
         for w in re.findall(r'\b[a-zA-Z]{3,}\b', sent.lower()):
             if w not in _STOPWORDS:
                 word_freq[w] += 1
 
     scored = []
-    for sent in sentences:
+    for sent in clean_sents:
         words = re.findall(r'\b[a-zA-Z]{3,}\b', sent.lower())
         score = sum(word_freq.get(w, 0) for w in words if w not in _STOPWORDS)
-        if re.search(r'\d', sent):
-            score *= 1.4   # boost sentences with numbers
+        if re.search(r'\$[\d,]+|[\d,.]+\s*%|[\d,.]+\s*(billion|million)', sent, re.I):
+            score *= 1.5   # strong boost for financial figures
+        elif re.search(r'\d', sent):
+            score *= 1.2
         scored.append((score, sent))
 
     scored.sort(key=lambda x: -x[0])
-    # Deduplicate near-identical sentences
-    seen = []
+
+    # Deduplicate (Jaccard > 0.55 = too similar)
+    seen, result = [], []
     for _, sent in scored:
-        if not any(_similar(sent, s) for s in seen):
+        if not any(_jaccard(sent, s) > 0.55 for s in seen):
             seen.append(sent)
-        if len(seen) == n_bullets:
+            bullet = sent if len(sent) <= 240 else sent[:237] + "..."
+            result.append(bullet)
+        if len(result) == n_bullets:
             break
 
-    # Wrap long bullets cleanly
-    result = []
-    for s in seen:
-        if len(s) > 220:
-            s = s[:217] + "..."
-        result.append(s)
     return result if result else ["No relevant information could be retrieved for this section."]
 
 
-def _similar(a: str, b: str, threshold: float = 0.7) -> bool:
-    """Rough Jaccard similarity check to remove near-duplicate bullets."""
-    wa = set(a.lower().split())
-    wb = set(b.lower().split())
-    if not wa or not wb:
-        return False
-    return len(wa & wb) / len(wa | wb) > threshold
+def _jaccard(a: str, b: str) -> float:
+    wa, wb = set(a.lower().split()), set(b.lower().split())
+    return len(wa & wb) / len(wa | wb) if (wa or wb) else 0.0
 
 
-# ── 6. PDF Generation ────────────────────────────────────────────────────────
+# ── 7. PDF Generation ─────────────────────────────────────────────────────────
 
 def build_pdf(sections_content: list, output_path: str):
     """Generate the structured summary PDF with reportlab."""
@@ -216,21 +304,22 @@ def build_pdf(sections_content: list, output_path: str):
     heading_style = ParagraphStyle(
         "SectionHeading",
         parent=styles["Heading2"],
-        fontSize=11,
+        fontSize=12,
         textColor=colors.HexColor("#1e40af"),
-        spaceBefore=14,
-        spaceAfter=6,
+        spaceBefore=16,
+        spaceAfter=7,
         fontName="Helvetica-Bold",
     )
     bullet_style = ParagraphStyle(
         "BulletText",
         parent=styles["Normal"],
-        fontSize=9,
+        fontSize=9.5,
         textColor=colors.HexColor("#1e293b"),
-        leftIndent=16,
-        firstLineIndent=-10,
-        leading=14,
-        spaceAfter=5,
+        leftIndent=18,
+        firstLineIndent=-12,
+        leading=15,
+        spaceAfter=6,
+        wordWrap="LTR",
     )
     footer_style = ParagraphStyle(
         "Footer",
@@ -242,8 +331,8 @@ def build_pdf(sections_content: list, output_path: str):
     doc = SimpleDocTemplate(
         output_path,
         pagesize=A4,
-        leftMargin=2.0 * cm,
-        rightMargin=2.0 * cm,
+        leftMargin=2.2 * cm,
+        rightMargin=2.2 * cm,
         topMargin=1.8 * cm,
         bottomMargin=1.8 * cm,
     )
@@ -266,13 +355,16 @@ def build_pdf(sections_content: list, output_path: str):
         block.append(Paragraph(sec["title"], heading_style))
         for bullet in sec["bullets"]:
             # Escape XML special chars for reportlab
-            safe = bullet.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            safe = (bullet
+                    .replace("&", "&amp;")
+                    .replace("<", "&lt;")
+                    .replace(">", "&gt;"))
             block.append(Paragraph(f"\u2022\u00a0 {safe}", bullet_style))
         block.append(Spacer(1, 4))
         story.append(KeepTogether(block))
 
     # Footer
-    story.append(Spacer(1, 10))
+    story.append(Spacer(1, 12))
     story.append(HRFlowable(
         width="100%", thickness=0.5,
         color=colors.HexColor("#cbd5e1"), spaceAfter=4
@@ -285,7 +377,7 @@ def build_pdf(sections_content: list, output_path: str):
     doc.build(story)
 
 
-# ── Main ─────────────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     if len(sys.argv) < 2:
@@ -315,7 +407,7 @@ def main():
     print("Loading embedding model...", flush=True)
     model = SentenceTransformer(MODEL_NAME)
     print("Generating embeddings...", flush=True)
-    index, _ = build_index(chunks, model)
+    index = build_index(chunks, model)
 
     # Step 4 — Retrieve & generate per section
     print("Retrieving relevant sections...", flush=True)
