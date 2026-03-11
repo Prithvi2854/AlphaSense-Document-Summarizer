@@ -180,20 +180,89 @@ def _long_word_ratio(sentence: str, threshold: int = 20) -> float:
 
 def is_garbled(sentence: str) -> bool:
     """
-    Return True if the sentence looks like concatenated table/encoding garbage.
-    Heuristics:
-      - Any single word > 35 chars (almost certainly a run-together string)
-      - >25% of words are longer than 20 chars
-      - Ratio of alpha chars is very low (symbol/number soup)
+    Return True if the sentence looks like garbage, table column data, or
+    raw number sequences that should not appear as a bullet.
     """
     if _max_word_len(sentence) > 35:
         return True
     if _long_word_ratio(sentence, threshold=20) > 0.25:
         return True
     alpha = sum(1 for c in sentence if c.isalpha())
-    if len(sentence) > 0 and alpha / len(sentence) < 0.40:
+    if len(sentence) > 0 and alpha / len(sentence) < 0.38:
+        return True
+    # Reject if it contains 3+ consecutive standalone dollar values (table column dump)
+    if len(re.findall(r'\$\s*[\d,\.]+', sentence)) >= 3:
+        return True
+    # Reject if it contains year columns like '2024 2023 2022' (table header dump)
+    if re.search(r'\b(20\d{2})\s+(20\d{2})\s+(20\d{2})\b', sentence):
         return True
     return False
+
+
+# Reference/noise patterns to strip from sentences before outputting as bullets
+_STRIP_REFS = [
+    # Table headers / scope markers
+    re.compile(r'\(?in millions(?:,\s*except[^)]*)?\)?', re.I),
+    re.compile(r'\(?millions of dollars\)?', re.I),
+    re.compile(r'\(?millions\)?(?=\s)', re.I),
+    re.compile(r'Year Ended December 3[01],?\s*', re.I),
+    re.compile(r'Three [Mm]onths [Ee]nded [A-Za-z]+ 3[01],?\s*', re.I),
+    re.compile(r'Nine [Mm]onths [Ee]nded [A-Za-z]+ 3[01],?\s*', re.I),
+    re.compile(r'December 31,?\s*', re.I),
+    re.compile(r'March 31,?\s*', re.I),
+    # Footnote markers like (a), (b), (1), etc.
+    re.compile(r'\([a-z\d]{1,2}\)'),
+    # Pipe separators left from table formatting
+    re.compile(r'\|'),
+]
+
+# Sentences that are clearly table intros or index lines — reject entirely
+_REJECT_PATTERNS = [
+    re.compile(r'following table', re.I),
+    re.compile(r'as follows:', re.I),
+    re.compile(r'see note \d', re.I),
+    re.compile(r'^table \d', re.I),
+    re.compile(r'refer to note', re.I),
+    re.compile(r'\(dollars in', re.I),
+]
+
+
+def clean_sentence(sent: str) -> str:
+    """
+    Strip table references, footnote markers, and other noise from a sentence.
+    Also ensure the sentence ends at a natural boundary (not mid-word).
+    Returns empty string if the sentence should be rejected entirely.
+    """
+    # Reject table-intro sentences
+    for pat in _REJECT_PATTERNS:
+        if pat.search(sent):
+            return ""
+
+    # Strip known noise patterns
+    for pat in _STRIP_REFS:
+        sent = pat.sub('', sent)
+
+    # Collapse multiple spaces left by stripping
+    sent = re.sub(r'[ \t]+', ' ', sent).strip()
+    sent = re.sub(r'\s*,\s*,', ',', sent)  # fix double commas
+    sent = re.sub(r'^[,;:\-\s]+', '', sent)  # strip leading punctuation
+
+    # If sentence ends mid-word (truncated), try to close at last period/comma
+    if sent.endswith('...') or (len(sent) > 80 and not sent[-1] in '.!?:'):
+        # Walk back to the last sentence-ending punctuation
+        last_end = max(sent.rfind('.'), sent.rfind('!'), sent.rfind('?'))
+        if last_end > len(sent) * 0.5:  # only truncate if we keep >50% of content
+            sent = sent[:last_end + 1]
+
+    # Final cleanup: strip trailing noise
+    sent = sent.strip(' ,;:|\t')
+    sent = re.sub(r'\s+', ' ', sent)
+
+    # Too short after cleaning = reject
+    if len(sent) < 40:
+        return ""
+
+    return sent
 
 
 # ── 3. Chunking ───────────────────────────────────────────────────────────────
@@ -306,31 +375,40 @@ def extract_bullets(
         sents.extend(sub if sub else ([s.strip()] if len(s.strip()) > 50 else []))
 
     # Filter: garbled, too short, and optionally requires a number
-    clean_sents = [
+    clean_sents_raw = [
         s for s in sents
-        if not is_garbled(s)
-        and len(s) > 55
-        and (not requires_numbers or has_numbers(s))
+        if not is_garbled(s) and len(s) > 55
     ]
 
-    # Fallback: if requires_numbers produced nothing, relax that constraint
-    if not clean_sents:
-        clean_sents = [s for s in sents if not is_garbled(s) and len(s) > 55]
+    # Apply sentence cleaner (strip references, fix truncation)
+    cleaned_pairs = []
+    for s in clean_sents_raw:
+        cs = clean_sentence(s)
+        if cs:
+            cleaned_pairs.append((cs, s))  # (cleaned, original)
 
-    if not clean_sents:
+    # Apply numbers filter on cleaned version
+    if requires_numbers:
+        cleaned_pairs = [(cs, orig) for cs, orig in cleaned_pairs if has_numbers(cs)]
+
+    # Fallback: if requires_numbers produced nothing, relax that constraint
+    if not cleaned_pairs:
+        cleaned_pairs = [(clean_sentence(s), s) for s in clean_sents_raw if clean_sentence(s)]
+
+    if not cleaned_pairs:
         return ["No relevant information could be retrieved for this section."]
 
     # TF scoring (financial relevance boost for numbers)
     word_freq = Counter()
-    for sent in clean_sents:
-        for w in re.findall(r'\b[a-zA-Z]{3,}\b', sent.lower()):
+    for cs, _ in cleaned_pairs:
+        for w in re.findall(r'\b[a-zA-Z]{3,}\b', cs.lower()):
             if w not in _STOPWORDS:
                 word_freq[w] += 1
 
     scored = []
-    for sent in clean_sents:
-        sc = score_sentence(sent, word_freq)
-        scored.append((sc, sent))
+    for cs, _ in cleaned_pairs:
+        sc = score_sentence(cs, word_freq)
+        scored.append((sc, cs))
 
     scored.sort(key=lambda x: -x[0])
 
